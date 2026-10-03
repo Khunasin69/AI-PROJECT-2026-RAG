@@ -1,0 +1,13 @@
+# ห้าม commit คีย์เด็ดขาด (ตามกฎข้อ 7)
+.env
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+# Test / eval
+.pytest_cache/
+eval/reports/
+# OS
+.DS_Store
+Thumbs.db
