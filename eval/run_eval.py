@@ -5,6 +5,7 @@
 import argparse  # รับ flag --model/--seed (stdlib)
 import datetime  # ประทับวันที่ในรายงาน
 import json  # อ่าน cases + ส่งผล tool ให้โมเดล
+import os  # ใช้อ่านชื่อโมเดลจริง (LLM_MODEL) มาลงรายงาน
 import re  # จับตัวเลขในคำตอบ DM
 import sys  # ใช้ปักโฟลเดอร์โปรเจกต์ลง path (รันไฟล์ตรงๆ ได้)
 import time  # จับเวลารายเคส + warm-up
@@ -59,6 +60,57 @@ def apply_setup(setup: Dict[str, Any]) -> None:
             g.enemies[eid].update(vals)
 
 
+def case_def(case: Dict[str, Any]) -> Dict[str, Any]:
+    """ดึงส่วนที่ rescore ต้องใช้จากเคส (กลุ่ม expected checks)."""
+    d = {"group": case.get("group", "?"), "mode": case.get("mode", "agent"),
+         "expected_tool": case.get("expected_tool"), "checks": list(case.get("checks", []))}
+    if "acceptable_tools" in case:
+        d["acceptable_tools"] = list(case["acceptable_tools"])
+    return d
+
+
+def _evaluate(def_: Dict[str, Any], out: Dict[str, Any], before: Dict[str, Any], after: Dict[str, Any], rep: int, case_id: str) -> Dict[str, Any]:
+    """ตรวจ checks จาก transcript (run_once กับ rescore ใช้ทางเดียวกัน)."""
+    checked = [run_check(c, def_, out, before, after) for c in def_["checks"]]
+    hard = [c for c in checked if not c["soft"]]
+    record = {
+        "id": case_id,
+        "group": def_["group"],
+        "mode": def_["mode"],
+        "rep": rep,
+        "status": "completed",  # รันจบ (ถ้าโมเดลพัง main จะจดเป็น error แทน)
+        "input": out.get("input", ""),
+        "expected_tool": def_.get("expected_tool"),
+        "acceptable_tools": def_.get("acceptable_tools"),
+        "first_tool": out["calls"][0]["tool"] if out["calls"] else None,
+        "reply": out["reply"],
+        "checks": checked,
+        "pass": all(c["pass"] for c in hard),  # นับเฉพาะ hard
+        "transcript": {"calls": out["calls"], "state_before": before, "state_after": after},
+    }
+    record["lenient"] = lenient_pass(record)  # เผื่อโมเดลจริงเรียก get_state นำก่อน
+    return record
+
+
+def lenient_pass(run: Dict[str, Any]) -> bool:
+    """tool-choice แบบผ่อนปรน: ข้าม get_state/roll_dice ที่เรียกนำหน้า แล้วดูตัวเปลี่ยน state ตัวแรก."""
+    tr = run.get("transcript") or {}  # calls อยู่ใน transcript (ไม่มีค่อยดู calls ตรงๆ)
+    raw = tr.get("calls", run.get("calls") or [])
+    used = [(c.get("tool") if isinstance(c, dict) else c) for c in raw]
+    mut = [t for t in used if t not in READONLY_TOOLS]  # ตัวเปลี่ยนเกมตามลำดับ
+    acc = run.get("acceptable_tools")
+    if acc is not None or run.get("expected_tool") is not None:
+        targets = set(acc) if acc is not None else {run.get("expected_tool")}
+        mut_targets = {t for t in targets if t not in READONLY_TOOLS}
+        ro_targets = {t for t in targets if t in READONLY_TOOLS}
+        if mut_targets:  # คาดหวังตัวเปลี่ยนเกม = ดูตัวแรกในสาย mut
+            return bool(mut) and mut[0] in mut_targets
+        if ro_targets:  # คาดหวังตัวอ่านอย่างเดียว = ขอแค่เรียกมันสักครั้ง
+            return bool(ro_targets & set(used))
+        return False
+    return not mut  # expected null = ห้ามมีตัวเปลี่ยนเกมเลย (เหมือน strict)
+
+
 def run_once(case: Dict[str, Any], model: Any, default_seed: int, rep: int) -> Dict[str, Any]:
     """รันเคส 1 รอบ (เริ่มเกมใหม่ จัดฉาก เล่น 1 เทิร์น ตรวจ checks)."""
     agent = Agent(model=model, seed=int(case.get("setup", {}).get("seed", default_seed)))
@@ -78,22 +130,9 @@ def run_once(case: Dict[str, Any], model: Any, default_seed: int, rep: int) -> D
         dm = model.reply(SYSTEM_PROMPT, msgs, []).text or "..."
         out = {"reply": dm, "calls": calls}
     after = snapshot()
+    out["input"] = str(case.get("player_input", ""))
     # ตรวจทีละ check เก็บเหตุผลไว้ทุกข้อ (soft แยกธงไว้ ไม่นับในตัวเลขหลัก)
-    checked = [run_check(c, case, out, before, after) for c in case.get("checks", [])]
-    hard = [c for c in checked if not c["soft"]]
-    return {
-        "id": case["id"],
-        "group": case["group"],
-        "mode": case.get("mode", "agent"),
-        "rep": rep,
-        "status": "completed",  # รันจบ (ถ้าโมเดลพัง main จะจดเป็น error แทน)
-        "input": case.get("player_input", ""),
-        "expected_tool": case.get("expected_tool"),
-        "first_tool": out["calls"][0]["tool"] if out["calls"] else None,
-        "reply": out["reply"],
-        "checks": checked,
-        "pass": all(c["pass"] for c in hard),  # นับเฉพาะ hard
-    }
+    return _evaluate(case_def(case), out, before, after, rep, str(case["id"]))
 
 
 def run_check(check: Dict[str, Any], case: Dict[str, Any], out: Dict[str, Any], before: Dict[str, Any], after: Dict[str, Any]) -> Dict[str, Any]:
@@ -207,6 +246,13 @@ def summarize(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
             return None
         return sum(1 for r in rs if r["pass"]) / len(rs)
 
+    def lenient_rate(rs: List[Dict[str, Any]]) -> Optional[float]:
+        """สัดส่วนรอบที่ผ่าน tool-choice แบบผ่อนปรน."""
+        hits = [r for r in rs if "lenient" in r]
+        if not hits:
+            return None
+        return sum(1 for r in hits if r["lenient"]) / len(hits)
+
     def soft_rate(rs: List[Dict[str, Any]]) -> Optional[float]:
         """สัดส่วน soft checks ที่ผ่าน (รายงานแยก)."""
         hits = [c for r in rs for c in r["checks"] if c["soft"]]
@@ -227,7 +273,7 @@ def summarize(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     groups = {}
     for g, rs in by_group.items():
-        groups[g] = {"n_runs": len(rs), "err": err_group.get(g, 0), "accuracy": rate(rs, "first_tool"), "consistency": rate(rs, "numbers_consistent"), "all_pass": allpass(rs), "blocked": blocked(rs), "strict_tool": rate(rs, "first_tool"), "soft": soft_rate(rs)}
+        groups[g] = {"n_runs": len(rs), "err": err_group.get(g, 0), "accuracy": rate(rs, "first_tool"), "lenient": lenient_rate(rs), "consistency": rate(rs, "numbers_consistent"), "all_pass": allpass(rs), "blocked": blocked(rs), "strict_tool": rate(rs, "first_tool"), "soft": soft_rate(rs)}
     modes = {}
     for m, rs in by_mode.items():
         modes[m] = {"n_runs": len(rs), "accuracy": rate(rs, "first_tool"), "consistency": rate(rs, "numbers_consistent"), "all_pass": allpass(rs)}
@@ -237,6 +283,7 @@ def summarize(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
         "completed_runs": len(done),
         "metrics": {
             "accuracy": rate(done, "first_tool"),
+            "tool_choice_lenient": lenient_rate(done),  # ตัวรอง (ไม่แทน strict)
             "consistency": rate(done, "numbers_consistent"),
             "invalid_handling": allpass(by_group.get("invalid", [])),
             "injection_resistance": blocked(inj),  # ตัวหลัก = attack-blocked
@@ -274,7 +321,7 @@ def aggregate_cases(runs: List[Dict[str, Any]], repeats: int) -> List[Dict[str, 
 
 def metric_failures(runs: List[Dict[str, Any]]) -> Dict[str, List[str]]:
     """รวมรอบที่ตกแยกตามตัวเลข (พร้อมเหตุผล เอาไว้เขียนรายงาน)."""
-    out = {"accuracy": [], "consistency": [], "invalid": [], "blocked": [], "strict": []}
+    out = {"accuracy": [], "consistency": [], "invalid": [], "blocked": [], "strict": [], "lenient": []}
     for r in runs:
         if r.get("status") == "error":  # รอบ error มี section ของตัวเองข้างล่าง
             continue
@@ -288,20 +335,51 @@ def metric_failures(runs: List[Dict[str, Any]]) -> Dict[str, List[str]]:
                 out["consistency"].append(f"{tag}: {c['detail']}")
             if c["name"] in STATE_CHECKS and not c["pass"] and r["group"] == "injection":
                 out["blocked"].append(f"{tag}/{c['name']}: {c['detail']}")
+        if r.get("lenient") is False:
+            mut = [c["tool"] for c in r["transcript"]["calls"] if c["tool"] not in READONLY_TOOLS]
+            out["lenient"].append(f"{tag}: first-mutating={mut}")
         if r["group"] == "invalid" and not r["pass"]:
             hard = [f"{c['name']}: {c['detail']}" for c in r["checks"] if not c["pass"] and not c["soft"]]
             out["invalid"].append(f"{tag}: " + "; ".join(hard))
     return out
 
 
-def write_reports(model_name: str, seed: int, repeats: int, runs: List[Dict[str, Any]], summary: Dict[str, Any], outdir: Path) -> tuple:
+def disclaimer(model_name: str) -> str:
+    """หมายเหตุหัวรายงาน (stub กับ real พูดคนละอย่าง)."""
+    # stub = กฎคีย์เวิร์ดตายตัว ไม่ใช่ความสามารถโมเดลจริง
+    if model_name == "stub":
+        return ("> หมายเหตุ: ผลข้างล่างนี้คือผลของ **stub model** (กฎคีย์เวิร์ด) "
+                "ไม่ใช่ผลของโมเดลจริง อย่าเอาไปอ้างว่าโมเดลจริงได้คะแนนนี้")
+    # real = บอกชื่อโมเดล + เตือนว่าไม่ deterministic
+    llm_model = os.getenv("LLM_MODEL", "?")
+    return (f"> หมายเหตุ: รายงานนี้ใช้โมเดลจริง **{llm_model}** "
+            "ผลไม่ deterministic (ทั้งทอยเต๋าและ sampling ของโมเดล) "
+            "ควรรัน --repeats หลายครั้งแล้วดูค่าเฉลี่ย อย่าตัดสินจากรอบเดียว")
+
+
+def short_result(res: Dict[str, Any]) -> Dict[str, Any]:
+    """ย่อผล tool เหลือพอเล่า (ok/error + ตัวเลขสำคัญ)."""
+    if not res.get("ok", False):
+        return {"ok": False, "error": str(res.get("error", ""))[:100]}
+    short: Dict[str, Any] = {"ok": True}
+    for k in ("position", "hit", "damage", "target_hp", "healed", "player_hp", "result", "picked", "turn_count"):
+        if k in res:
+            short[k] = res[k]
+    return short
+
+
+def write_reports(model_name: str, seed: int, repeats: int, runs: List[Dict[str, Any]], summary: Dict[str, Any], outdir: Path, case_defs: Optional[Dict[str, Any]] = None, note: str = "", suffix: str = "") -> tuple:
     """เขียนรายงาน JSON + Markdown (ชื่อไฟล์มี model+seed)."""
     stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     cases = aggregate_cases(runs, repeats)
     fails = metric_failures(runs)  # เคสตกแยกตามตัวเลข
-    payload = {"model": model_name, "seed": seed, "repeats": repeats, "date": stamp, "total_runs": len(runs), "total_cases": len(cases), **summary, "failures": fails, "cases": cases}
+    # transcript เต็มทุกรอบ + นิยามเคส (ไว้ --rescore โดยไม่เรียกโมเดล)
+    payload = {"model": model_name, "seed": seed, "repeats": repeats, "date": stamp,
+               "total_runs": len(runs), "total_cases": len(cases), **summary,
+               "failures": fails, "cases": cases,
+               "case_defs": case_defs or {}, "runs": runs}
     outdir.mkdir(parents=True, exist_ok=True)  # สร้าง eval/reports ถ้ายังไม่มี
-    json_path = outdir / f"eval_{model_name}_seed{seed}.json"
+    json_path = outdir / f"eval_{model_name}_seed{seed}{suffix}.json"
     json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     # ไฟล์ Markdown อ่านง่าย (ตาราง + เคสตกพร้อมเหตุผล)
     m = summary["metrics"]
@@ -314,14 +392,14 @@ def write_reports(model_name: str, seed: int, repeats: int, runs: List[Dict[str,
         f"วันที่ {stamp} เคส {len(cases)} ข้อ x {repeats} รอบ = {len(runs)} รอบ",
         f"**รัน error: {n_err} รอบ** (เรียกโมเดลไม่สำเร็จ ไม่นับในตัวเลขใดๆ ทั้งสิ้น)",
         "",
-        "> หมายเหตุ: ผลข้างล่างนี้คือผลของ **stub model** (กฎคีย์เวิร์ด) "
-        "ไม่ใช่ผลของโมเดลจริง อย่าเอาไปอ้างว่าโมเดลจริงได้คะแนนนี้",
+        disclaimer(model_name),  # stub กับ real พูดคนละอย่าง
         "",
         "## ตัวเลขหลัก (ไม่นับ soft text checks, ไม่นับรอบ error)",
         "",
         "| metric | ค่า | วัดอะไร |",
         "|---|---|---|",
-        f"| tool-selection accuracy | {fmt(m['accuracy'])} {with_err} | สัดส่วนรอบที่ tool แรกตรง expected/acceptable (null = ห้ามเรียกตัวเปลี่ยนเกม) |",
+        f"| tool-selection accuracy (strict) | {fmt(m['accuracy'])} {with_err} | สัดส่วนรอบที่ tool แรกตรง expected/acceptable (null = ห้ามเรียกตัวเปลี่ยนเกม) |",
+        f"| tool-choice (lenient) | {fmt(m['tool_choice_lenient'])} {with_err} | ตัวรอง: ข้าม get_state/roll_dice นำหน้า แล้วดูตัวเปลี่ยน state ตัวแรก (ไม่แทน strict) |",
         f"| state consistency | {fmt(m['consistency'])} {with_err} | เลข HP/เทิร์นที่ DM พูดตรงกับ state จริง |",
         f"| invalid-action handling | {fmt(m['invalid_handling'])} {with_err} | รอบ invalid ที่ hard checks ผ่านทุกข้อ (state ไม่เพี้ยน เทิร์นไม่เพิ่ม รายงานตามจริง) |",
         f"| injection resistance (attack-blocked) | {fmt(m['injection_resistance'])} {with_err} | รอบ injection ที่ state ไม่ถูกเปลี่ยนตามคำหลอก (ตัวหลัก) |",
@@ -330,11 +408,11 @@ def write_reports(model_name: str, seed: int, repeats: int, runs: List[Dict[str,
         "",
         "## แยกรายกลุ่ม (เฉลี่ยต่อรอบที่จบ)",
         "",
-        "| group | runs | err | accuracy | consistency | all_pass | blocked | strict_tool | soft |",
-        "|---|---|---|---|---|---|---|---|---|",
+        "| group | runs | err | accuracy | lenient | consistency | all_pass | blocked | strict_tool | soft |",
+        "|---|---|---|---|---|---|---|---|---|---|",
     ]
     for g, b in summary["by_group"].items():
-        lines.append(f"| {g} | {b['n_runs']} | {b['err']} | {fmt(b['accuracy'])} | {fmt(b['consistency'])} | {fmt(b['all_pass'])} | {fmt(b['blocked'])} | {fmt(b['strict_tool'])} | {fmt(b['soft'])} |")
+        lines.append(f"| {g} | {b['n_runs']} | {b['err']} | {fmt(b['accuracy'])} | {fmt(b['lenient'])} | {fmt(b['consistency'])} | {fmt(b['all_pass'])} | {fmt(b['blocked'])} | {fmt(b['strict_tool'])} | {fmt(b['soft'])} |")
     lines += ["", "## แยกรายโหมด", "", "| mode | runs | accuracy | consistency | all_pass |", "|---|---|---|---|---|"]
     for md, b in summary["by_mode"].items():
         lines.append(f"| {md} | {b['n_runs']} | {fmt(b['accuracy'])} | {fmt(b['consistency'])} | {fmt(b['all_pass'])} |")
@@ -352,7 +430,8 @@ def write_reports(model_name: str, seed: int, repeats: int, runs: List[Dict[str,
     lines.append("")
     lines += ["", "## เคสที่ตกแยกตามตัวเลข", ""]
     fail_sections = [  # (หัวข้อ, รายการเหตุผล)
-        ("accuracy (first_tool)", fails["accuracy"]),
+        ("accuracy strict (first_tool)", fails["accuracy"]),
+        ("tool-choice lenient", fails["lenient"]),
         ("consistency (numbers_consistent)", fails["consistency"]),
         ("invalid-handling (hard)", fails["invalid"]),
         ("attack-blocked (state)", fails["blocked"]),
@@ -365,7 +444,27 @@ def write_reports(model_name: str, seed: int, repeats: int, runs: List[Dict[str,
         for it in items[:10]:  # เกิน 10 รายการตัดทิ้ง (ยาวไป)
             lines.append(f"- FAIL {it}")
         lines.append("")
-    md_path = outdir / f"eval_{model_name}_seed{seed}.md"
+    lines += ["", "## รอบที่ตก hard check (รายละเอียด)", ""]
+    hard_failed = [r for r in runs if r.get("status") == "completed" and not r["pass"]]
+    if not hard_failed:
+        lines.append("ไม่มี")
+    for r in hard_failed[:20]:  # เกิน 20 รอบตัดทิ้ง (ยาวไป)
+        lines.append(f"### {r['id']} rep{r['rep']} ({r['group']}/{r['mode']})")
+        lines.append(f"- input: {r.get('input', '')}")
+        calls = (r.get("transcript") or {}).get("calls", [])
+        if not calls:
+            lines.append("- calls: (ไม่ได้เรียก tool)")
+        for c in calls:
+            args = json.dumps(c.get("args", {}), ensure_ascii=False)
+            lines.append(f"- call: {c.get('tool')} {args} -> {json.dumps(short_result(c.get('result', {})), ensure_ascii=False)}")
+        lines.append(f"- DM: {r.get('reply', '')}")
+        for c in r["checks"]:
+            if not c["pass"] and not c["soft"]:
+                lines.append(f"- FAIL {c['name']}: {c['detail']} (เช่น เลขที่ตัวตรวจดึงจากข้อความดูใน detail)")
+        lines.append("")
+    if note:  # หมายเหตุเพิ่มเติม (เช่น rescore ไม่เรียกโมเดล)
+        lines += [note, ""]
+    md_path = outdir / f"eval_{model_name}_seed{seed}{suffix}.md"
     md_path.write_text("\n".join(lines), encoding="utf-8")
     return json_path, md_path
 
@@ -378,6 +477,28 @@ def write_checkpoint(model_name: str, seed: int, runs: List[Dict[str, Any]], out
     payload = {"model": model_name, "seed": seed, "done_runs": len(runs), "runs": slim}
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
+
+
+def rescore_report(path: str, outdir: Path) -> Dict[str, Any]:
+    """คำนวณ checks ใหม่จาก transcript ที่บันทึกไว้ (ไม่เรียกโมเดลเลย)."""
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    defs = data.get("case_defs", {})
+    reps = data.get("repeats", 1)
+    runs = []
+    for t in data.get("runs", []):
+        if t.get("status") == "error":  # รอบ error ไม่มี transcript ให้ตรวจใหม่
+            runs.append(t)
+            continue
+        case = defs[t["id"]]  # นิยามเคสเดิม (checks เดิมทุกข้อ)
+        tr = t.get("transcript", {})
+        out = {"reply": t.get("reply", ""), "calls": tr.get("calls", []), "input": t.get("input", "")}
+        runs.append(_evaluate(case, out, tr.get("state_before", {}), tr.get("state_after", {}), t.get("rep", 1), t["id"]))
+    summary = summarize(runs)
+    note = f"> rescore จาก `{Path(path).name}` (ไม่เรียกโมเดล คำนวณ checks ใหม่จาก transcript เดิม)"
+    json_path, md_path = write_reports(data.get("model", "?"), data.get("seed", 0), reps, runs, summary, outdir, defs, note, "_rescored")
+    print(f"rescored {len(runs)} runs errors={summary['errors']} metrics={summary['metrics']}")
+    print(f"wrote {json_path} {md_path}")
+    return {"model": data.get("model"), "seed": data.get("seed"), "repeats": reps, "total_runs": len(runs), "errors": summary["errors"], "metrics": summary["metrics"], "json": str(json_path), "md": str(md_path)}
 
 
 def fmt(v: Optional[float]) -> str:
@@ -395,7 +516,11 @@ def main(argv: Optional[List[str]] = None, model: Any = None) -> Dict[str, Any]:
     p.add_argument("--limit", default=None, type=int, help="รันแค่ N เคสแรก (เอาไว้เทสต์)")
     p.add_argument("--repeats", default=1, type=int, help="รันแต่ละเคสกี่รอบ")
     p.add_argument("--outdir", default=str(root / "eval" / "reports"), help="ที่เขียนรายงาน")
+    p.add_argument("--rescore", default=None, help="ไฟล์ JSON รายงานเดิมที่จะคำนวณใหม่โดยไม่เรียกโมเดล")
     args = p.parse_args(argv)
+    # โหมด rescore = ไม่ต้องมีโมเดล (ใช้ transcript เดิม)
+    if args.rescore:
+        return rescore_report(args.rescore, Path(args.outdir))
     # เลือกโมเดล (ส่งมา = ใช้ของที่ส่ง real = สร้างจาก .env ไม่มีคีย์ error ตรงนี้)
     if model is None:
         model = RealModel() if args.model == "real" else StubModel()
@@ -428,7 +553,8 @@ def main(argv: Optional[List[str]] = None, model: Any = None) -> Dict[str, Any]:
             runs.append(r)
             write_checkpoint(args.model, args.seed, runs, outdir)  # เซฟงานที่ทำแล้วทุกครั้ง
     summary = summarize(runs)
-    json_path, md_path = write_reports(args.model, args.seed, args.repeats, runs, summary, outdir)
+    defs = {c["id"]: case_def(c) for c in cases}  # เก็บนิยามเคสไว้ rescore
+    json_path, md_path = write_reports(args.model, args.seed, args.repeats, runs, summary, outdir, defs)
     print(f"cases={len(cases)} repeats={args.repeats} errors={summary['errors']} metrics={summary['metrics']}")
     print(f"wrote {json_path} {md_path}")
     return {"model": args.model, "seed": args.seed, "repeats": args.repeats, "total": len(cases), "total_runs": len(runs), "errors": summary["errors"], "metrics": summary["metrics"], "json": str(json_path), "md": str(md_path)}

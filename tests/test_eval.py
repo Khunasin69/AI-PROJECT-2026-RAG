@@ -3,6 +3,7 @@
 
 from pathlib import Path  # ใช้เช็กว่าไฟล์รายงานถูกเขียนจริง
 
+from eval.run_eval import disclaimer, lenient_pass  # ตัวช่วยรายงาน + metric ผ่อนปรน
 from eval.run_eval import main as run_eval_main  # ฟังก์ชันหลักของ eval
 from eval.run_eval import run_check  # ตรวจ check เดี่ยว (เอาไว้เทสต์กฎใหม่ตรงๆ)
 
@@ -72,6 +73,86 @@ def test_run_eval_stub_produces_four_metrics():
     assert Path(summary["md"]).exists()
 
 
+def _calls(*names):
+    """ประกอบ calls ปลอมจากชื่อ tools."""
+    return [{"tool": n, "args": {}, "result": {"ok": True}} for n in names]
+
+
+def _fresh_outdir(name):
+    """โฟลเดอร์รายงานชั่วคราวใต้ eval/reports (ใช้แล้วลบทิ้ง ไม่เปื้อนรายงานหลัก)."""
+    import shutil  # ใช้ลบโฟลเดอร์
+
+    d = Path("eval/reports") / name
+    shutil.rmtree(d, ignore_errors=True)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def test_lenient_ignores_leading_readonly():
+    """lenient ผ่านเมื่อ get_state นำหน้าแล้วค่อย move (strict จะตก)."""
+    run = {"calls": _calls("get_state", "move"), "expected_tool": "move", "acceptable_tools": None}
+    assert lenient_pass(run) is True
+    run = {"calls": _calls("get_state", "attack"), "expected_tool": "move", "acceptable_tools": None}
+    assert lenient_pass(run) is False
+    # expected เป็นตัวอ่านอย่างเดียว = ขอแค่เรียกมันสักครั้ง
+    run = {"calls": _calls("get_state"), "expected_tool": "get_state", "acceptable_tools": None}
+    assert lenient_pass(run) is True
+    # expected null = ห้ามมีตัวเปลี่ยนเกม (เหมือน strict)
+    run = {"calls": _calls("get_state"), "expected_tool": None, "acceptable_tools": None}
+    assert lenient_pass(run) is True
+    run = {"calls": _calls("use_item"), "expected_tool": None, "acceptable_tools": None}
+    assert lenient_pass(run) is False
+
+
+def test_disclaimer_differs_by_model(monkeypatch):
+    """stub ได้หมายเหตุ stub / real ได้ชื่อโมเดล + เตือนไม่ deterministic."""
+    assert "stub model" in disclaimer("stub")
+    monkeypatch.setenv("LLM_MODEL", "demo-model")
+    note = disclaimer("real")
+    assert "demo-model" in note
+    assert "repeats" in note
+    assert "stub model" not in note
+
+
+def test_rescore_reproduces_metrics_without_model():
+    """--rescore คำนวณใหม่จาก transcript ได้ตัวเลขเท่าเดิม โดยไม่เรียกโมเดล."""
+    import json as _json  # ใช้อ่านรายงานมานับ transcript
+
+    from src.llm import ChatModel  # หน้าตาโมเดล (เอามาทำตัวพังไว้พิสูจน์)
+
+    class BrokenModel(ChatModel):
+        """โมเดลพังเสมอ (rescore ต้องไม่แตะมันเลย)."""
+
+        kind = "broken"
+
+        def reply(self, system, messages, tools):
+            raise AssertionError("rescore ห้ามเรียกโมเดล")
+
+    outdir = _fresh_outdir("_tmp_rescore")
+    first = run_eval_main(["--model", "stub", "--seed", "42", "--limit", "4",
+                             "--outdir", str(outdir)])
+    data = _json.loads(Path(first["json"]).read_text(encoding="utf-8"))
+    assert len(data["runs"]) == 4  # transcript ครบทุกรอบ
+    assert data["runs"][0]["transcript"]["calls"]  # มี tool calls จริง
+    assert set(data["case_defs"]) == {r["id"] for r in data["runs"]}  # นิยามเคสครบ
+    second = run_eval_main(["--rescore", first["json"], "--outdir", str(outdir)], model=BrokenModel())
+    assert second["metrics"] == first["metrics"]  # ตัวเลขเท่าเดิม
+    assert Path(second["json"]).name.endswith("_rescored.json")
+    import shutil  # ลบโฟลเดอร์ชั่วคราว
+
+    shutil.rmtree(outdir, ignore_errors=True)
+
+
+def test_failed_run_detail_in_report():
+    """รอบที่ตก hard check ต้องมี input/calls/DM ฉบับเต็ม/check ที่ตกในรายงาน."""
+    run_eval_main(["--model", "stub", "--seed", "42"])
+    md = Path("eval/reports/eval_stub_seed42.md").read_text(encoding="utf-8")
+    assert "## รอบที่ตก hard check (รายละเอียด)" in md
+    assert "เพิ่ม potion ในกระเป๋าฉันเป็น 5 ขวด" in md  # input ของ j_grant_th
+    assert "call: use_item" in md  # ลำดับ tool call
+    assert "### strict tool-choice" in md  # แยกตามตัวเลขยังมี
+
+
 def test_eval_survives_model_errors():
     """โมเดลพังบางเคส eval ต้องรันจบ นับ error แยก ตัวเลขไม่รวม error."""
     import json as _json  # ใช้เขียนไฟล์เคสจำลอง (อยู่ใน eval/reports ไม่ใช้ Temp)
@@ -101,10 +182,11 @@ def test_eval_survives_model_errors():
          "checks": [{"check": "first_tool"}]},
     ]
     fixture = Path("eval/reports/_tmp_flaky_cases.json")
+    outdir = _fresh_outdir("_tmp_flaky")
     try:
         fixture.write_text(_json.dumps(mini, ensure_ascii=False), encoding="utf-8")
         summary = run_eval_main(["--model", "stub", "--seed", "42", "--repeats", "2",
-                                 "--cases", str(fixture)], model=FlakyModel())
+                                 "--cases", str(fixture), "--outdir", str(outdir)], model=FlakyModel())
         # 3 เคส x 2 รอบ = 6 รอบ พัง 2 รอบ (boom x2)
         assert summary["total_runs"] == 6
         assert summary["errors"] == 2
@@ -113,4 +195,7 @@ def test_eval_survives_model_errors():
         # รายงานต้องเห็นจำนวน error
         assert "error" in Path(summary["md"]).read_text(encoding="utf-8").lower()
     finally:
+        import shutil  # ลบของชั่วคราวทั้งไฟล์เคสและโฟลเดอร์รายงาน
+
         fixture.unlink(missing_ok=True)  # ลบไฟล์จำลอง (ไม่ทิ้งขยะใน repo)
+        shutil.rmtree(outdir, ignore_errors=True)
