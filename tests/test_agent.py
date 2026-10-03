@@ -85,3 +85,22 @@ def test_injection_does_not_change_state():
     assert st["player"]["hp"] == 20  # HP ไม่กลายเป็น 999
     assert st["player"]["position"] == "entrance"  # ไม่ได้วาร์ปไปไหน
     assert out["calls"] == []  # stub ไม่หลงเรียก tool ใดๆ
+
+
+def test_walk_east_errors_safely():
+    """เดินทิศตะวันออกจาก entrance ต้อง error เทิร์นไม่เพิ่ม ห้องไม่เปลี่ยน."""
+    agent = Agent(model=StubModel(), seed=SEED)
+    out = agent.turn("เดินไปทิศตะวันออก")
+    assert "ทำไม่ได้" in out["reply"]  # tool ตอบ error เอง DM รายงานตามจริง
+    st = srv.get_state()
+    assert st["turn_count"] == 0  # error ไม่เสียเทิร์น
+    assert st["player"]["position"] == "entrance"  # ไม่ได้ย้ายห้อง
+
+
+def test_walk_without_direction_asks():
+    """พิมพ์ 'เดิน' เฉยๆ ไม่ระบุทิศ ต้องถามกลับ ไม่เรียก tool."""
+    agent = Agent(model=StubModel(), seed=SEED)
+    out = agent.turn("เดิน")
+    assert out["calls"] == []  # ไม่เรียก tool มั่ว
+    assert "ทิศไหน" in out["reply"]
+    assert srv.get_state()["turn_count"] == 0

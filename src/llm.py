@@ -4,7 +4,7 @@
 import json  # ใช้แกะ arguments ของ tool call
 import os  # ใช้อ่านค่า LLM_* จาก env
 from dataclasses import dataclass, field  # สร้างคลาสเก็บข้อมูลแบบง่าย
-from typing import Any, Dict, List  # type hints ให้อ่านง่าย
+from typing import Any, Dict, List, Optional  # type hints ให้อ่านง่าย
 
 import httpx  # ยิง HTTP (มากับ mcp อยู่แล้ว ไม่ต้องลงเพิ่ม)
 from dotenv import load_dotenv  # โหลดไฟล์ .env เข้า env
@@ -130,11 +130,14 @@ class StubModel(ChatModel):
             if _has(text, ["orc", "ออร์ค", "อ๊อค", "บอส", "boss"]):
                 return ModelReply(tool_calls=[ToolCall("attack", {"target": "orc"})])
             return ModelReply(text="จะตีตัวไหนเหรอ (goblin หรือ orc)?")
-        # เดิน (เช็ก south ก่อน เพราะคำว่า กลับ/ถอย แปลว่าย้อน)
-        if _has(text, ["south", "ใต้", "ถอย", "กลับ"]):
-            return ModelReply(tool_calls=[ToolCall("move", {"direction": "south"})])
-        if _has(text, ["north", "เหนือ", "เดิน", "ไป", "go", "ข้างหน้า", "ต่อ"]):
-            return ModelReply(tool_calls=[ToolCall("move", {"direction": "north"})])
+        # เดิน: อ่านทิศจากคำบอกทิศก่อน (เหนือ/ใต้/ตะวันออก/ตะวันตก)
+        # เจอทิศไหนส่งทิศนั้นให้ tool (ทิศผิดให้ tool ตอบ error เอง stub ห้ามตัดสิน)
+        direction = _read_direction(text)
+        if direction is not None:
+            return ModelReply(tool_calls=[ToolCall("move", {"direction": direction})])
+        # มีแต่คำกริยา (เดิน/ไป) ไม่ระบุทิศ = ถามกลับ ไม่เรียก tool มั่ว
+        if _has(text, ["เดิน", "ไป", "go", "ถอย", "กลับ"]):
+            return ModelReply(text="จะเดินไปทิศไหนเหรอ (north หรือ south)?")
         # ใช้ยา
         if _has(text, ["potion", "ยา", "ฮีล", "heal", "กิน", "ดื่ม"]):
             return ModelReply(tool_calls=[ToolCall("use_item", {"item": "potion"})])
@@ -146,6 +149,23 @@ class StubModel(ChatModel):
             return ModelReply(tool_calls=[ToolCall("get_state", {})])
         # ไม่เข้าข่ายไหนเลย = บอกตรงๆ ว่าไม่เข้าใจ ไม่เรียก tool มั่ว
         return ModelReply(text="ขอโทษ ไม่เข้าใจคำสั่ง ลองบอกว่าจะเดินไปไหน ตีตัวอะไร หรือใช้ยา")
+
+
+def _read_direction(text: str) -> Optional[str]:
+    """อ่านทิศจากข้อความ (เจอคำบอกทิศคืนทิศนั้น ไม่เจอคืน None)."""
+    # เช็กตะวันออก/ตกก่อน (คำยาว กันไปชนคำสั้น)
+    if _has(text, ["ตะวันออก", "east"]):
+        return "east"
+    if _has(text, ["ตะวันตก", "west"]):
+        return "west"
+    if _has(text, ["เหนือ", "north"]):
+        return "north"
+    if _has(text, ["ใต้", "south"]):
+        return "south"
+    # ดันเจี้ยนเป็นเส้นตรง คำว่าเดินหน้าคือ north (ไม่มีในข้อความ = None)
+    if _has(text, ["ข้างหน้า", "เดินหน้า"]):
+        return "north"
+    return None
 
 
 def _pick_sides(text: str) -> int:
