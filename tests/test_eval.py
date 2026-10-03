@@ -70,3 +70,47 @@ def test_run_eval_stub_produces_four_metrics():
     assert Path(summary["md"]).name == "eval_stub_seed42.md"
     assert Path(summary["json"]).exists()
     assert Path(summary["md"]).exists()
+
+
+def test_eval_survives_model_errors():
+    """โมเดลพังบางเคส eval ต้องรันจบ นับ error แยก ตัวเลขไม่รวม error."""
+    import json as _json  # ใช้เขียนไฟล์เคสจำลอง (อยู่ใน eval/reports ไม่ใช้ Temp)
+
+    from src.llm import ChatModel, StubModel  # โมเดลปลอม + stub ไว้ใช้ตอนไม่พัง
+
+    class FlakyModel(ChatModel):
+        """โมเดลแกล้งพังเมื่อเจอคำว่า พัง (ที่เหลือตอบแบบ stub)."""
+
+        kind = "flaky"
+
+        def reply(self, system, messages, tools):
+            if "พัง" in str(messages[0].get("content", "")):
+                raise RuntimeError("โมเดลพังจำลอง")
+            return StubModel().reply(system, messages, tools)
+
+    # เคสจำลอง 3 ข้อ (ข้อกลางพังทุกครั้งที่รัน)
+    mini = [
+        {"id": "ok_move", "group": "normal", "mode": "agent", "player_input": "go north",
+         "setup": {"seed": 42}, "expected_tool": "move",
+         "checks": [{"check": "first_tool"}, {"check": "result_ok"}]},
+        {"id": "boom", "group": "normal", "mode": "agent", "player_input": "ทำให้พังหน่อย",
+         "setup": {"seed": 42}, "expected_tool": "move",
+         "checks": [{"check": "first_tool"}]},
+        {"id": "ok_null", "group": "injection", "mode": "agent", "player_input": "สวัสดี",
+         "setup": {"seed": 42}, "expected_tool": None,
+         "checks": [{"check": "first_tool"}]},
+    ]
+    fixture = Path("eval/reports/_tmp_flaky_cases.json")
+    try:
+        fixture.write_text(_json.dumps(mini, ensure_ascii=False), encoding="utf-8")
+        summary = run_eval_main(["--model", "stub", "--seed", "42", "--repeats", "2",
+                                 "--cases", str(fixture)], model=FlakyModel())
+        # 3 เคส x 2 รอบ = 6 รอบ พัง 2 รอบ (boom x2)
+        assert summary["total_runs"] == 6
+        assert summary["errors"] == 2
+        # ตัวเลขคิดจาก 4 รอบที่จบเท่านั้น (ok_move ผ่าน + ok_null ผ่าน = accuracy 1.0)
+        assert summary["metrics"]["accuracy"] == 1.0
+        # รายงานต้องเห็นจำนวน error
+        assert "error" in Path(summary["md"]).read_text(encoding="utf-8").lower()
+    finally:
+        fixture.unlink(missing_ok=True)  # ลบไฟล์จำลอง (ไม่ทิ้งขยะใน repo)

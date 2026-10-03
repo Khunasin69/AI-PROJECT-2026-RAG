@@ -200,6 +200,14 @@ def _narrate_tool(name: str, result: Dict[str, Any]) -> str:
     return "เรียบร้อย"
 
 
+def _read_timeout() -> float:
+    """อ่าน LLM_TIMEOUT จาก env (ไม่ตั้ง/ผิดรูปแบบ = 300 วินาที)."""
+    try:
+        return float(os.getenv("LLM_TIMEOUT", "300"))
+    except ValueError:
+        return 300.0  # ใส่ตัวเลขไม่ได้ = ใช้ค่าเริ่มต้น
+
+
 class RealModel(ChatModel):
     """โมเดลจริงผ่าน OpenAI-compatible API (chat completions + tool calling)."""
 
@@ -210,6 +218,7 @@ class RealModel(ChatModel):
         base_url: str = "",  # ไม่ส่งมา = อ่านจาก env
         api_key: str = "",  # ไม่ส่งมา = อ่านจาก env
         model: str = "",  # ไม่ส่งมา = อ่านจาก env
+        timeout: float = 0,  # ไม่ส่งมา (<=0) = อ่านจาก env
     ) -> None:
         """จำค่า config (base_url ตัด / ท้ายออก กันต่อ path เบิ้ล)."""
         self.base_url = (base_url or os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")).rstrip("/")
@@ -220,25 +229,37 @@ class RealModel(ChatModel):
             raise ValueError("ไม่มี LLM_API_KEY ใน .env ให้เล่นด้วย --model stub แทน")
         if not self.model:
             raise ValueError("ไม่มี LLM_MODEL ใน .env ให้ตั้งชื่อโมเดลก่อน")
+        self.timeout = timeout if timeout > 0 else _read_timeout()
+        self.retries = 1  # หมดเวลาให้ลองใหม่ได้อีก 1 ครั้ง (รวมยิงสูงสุด 2 ครั้ง)
+
+    def _post(self, payload: Dict[str, Any]) -> Any:
+        """ยิง HTTP 1 ครั้ง (แยกไว้ให้เทสต์ mock ง่าย)."""
+        return httpx.post(
+            f"{self.base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            json=payload,
+            timeout=self.timeout,
+        )
 
     def reply(self, system: str, messages: List[Dict[str, str]], tools: List[Dict[str, Any]]) -> ModelReply:
-        """ยิง chat completions 1 ครั้ง แล้วแปลง tool_calls กลับเป็นของเรา."""
+        """ยิง chat completions (หมดเวลาลองใหม่ 1 ครั้ง) แล้วแปลง tool_calls กลับเป็นของเรา."""
         payload = {  # body ตามสเปก OpenAI
             "model": self.model,
             "messages": [{"role": "system", "content": system}] + messages,
             "tools": tools,
             "tool_choice": "auto",  # ให้โมเดลเลือกเองว่าจะเรียก tool หรือตอบเลย
         }
-        try:
-            resp = httpx.post(
-                f"{self.base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                json=payload,
-                timeout=60.0,  # กันค้าง (60 วินาทีพอ)
-            )
-            resp.raise_for_status()  # status 4xx/5xx ให้ error ทันที
-        except Exception as e:
-            raise RuntimeError(f"เรียก LLM ไม่สำเร็จ: {e}") from e
+        for attempt in (1, 2):  # รอบ 1 = ยิงจริง รอบ 2 = retry
+            try:
+                resp = self._post(payload)
+                resp.raise_for_status()  # status 4xx/5xx ให้ error ทันที
+                break  # สำเร็จ = ออกจาก loop
+            except httpx.TimeoutException as e:  # หมดเวลา = ลองใหม่ได้อีก 1 ครั้ง
+                if attempt == 1:
+                    continue  # รอบแรกหมดเวลา = ใช้โควตา retry
+                raise RuntimeError(f"เรียก LLM หมดเวลา ({type(e).__name__} timeout={self.timeout}s ลองใหม่ {self.retries} ครั้งแล้ว): {e}") from e
+            except Exception as e:  # error อื่น (เน็ต/คีย์/status) ไม่ retry
+                raise RuntimeError(f"เรียก LLM ไม่สำเร็จ ({type(e).__name__}): {e}") from e
         msg = resp.json()["choices"][0]["message"]  # เอาข้อความแรกที่โมเดลตอบ
         calls = []  # แปลง tool_calls ของ OpenAI เป็นของเรา
         for tc in msg.get("tool_calls") or []:
