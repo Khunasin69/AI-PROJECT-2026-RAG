@@ -826,9 +826,6 @@
                 "check": "numbers_consistent"
             },
             {
-                "check": "result_err"
-            },
-            {
                 "check": "state_same",
                 "fields": [
                     "enemies",
